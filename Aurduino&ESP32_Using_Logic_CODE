@@ -1,0 +1,589 @@
+// =====================================================
+//  PROSTHETIC ARM - EMG + BLUETOOTH CONTROL  (2 Motors)
+//  Hardware:
+//    - Muscle BioAmp Patchy v0.2  →  A0
+//    - L298N Motor Driver
+//        IN1 → D8,  IN2 → D9   (Motor 1 — gripper open/close)
+//        IN3 → D10, IN4 → D11  (Motor 2 — suction/forward/backward)
+//    - HC-05 Bluetooth Module
+//        TX → D2, RX → D3 (via voltage divider)
+//    - SPST Switch 1 (Mode Bit A)  → D7, GND
+//    - SPST Switch 2 (Mode Bit B)  → D6, GND
+//
+//  ─── FOUR OPERATING MODES ───────────────────────────
+//  MODE 1 — SW1 OFF, SW2 OFF : Motor 1 NORMAL open/close toggle
+//  MODE 2 — SW1 ON,  SW2 OFF : Motor 1 FORWARD-ONLY on each EMG pulse
+//  MODE 3 — SW1 ON,  SW2 ON  : Motor 2 (SUCTION) EMG toggle, Motor 1 OFF
+//  MODE 4 — SW1 OFF, SW2 ON  : Motor 1 CYCLE Fwd→Stop→Bwd→Stop→...
+//
+//  ─── BLUETOOTH COMMANDS (App → Arduino) ─────────────
+//  Motor control:
+//    'F' → Motor 1 forward  (runs until 'S')
+//    'B' → Motor 1 backward (runs until 'S') 
+//    'L' → Motor 2 forward  (runs until 'S')   [suction ON ]
+//    'R' → Motor 2 backward (runs until 'S')   [suction OFF]
+//    'S' → Stop active motor, resume EMG
+//
+//  Graph stream:
+//    'G' → Start streaming  G:RAW,ENVELOPE,THRESHOLD,M2_THRESHOLD\n
+//    'X' → Stop  streaming
+//
+//  Motor 1 tunable parameters (app Calibration sliders):
+//    'P1:<v>\n' → CALIBRATION_SAMPLES       (100–1000)
+//    'P2:<v>\n' → THRESHOLD_MULTIPLIER×100  (100–200)
+//    'P3:<v>\n' → ACTIVATION_COUNT          (5–100)
+//    'P4:<v>\n' → DEACTIVATION_COUNT        (5–100)
+//    'P5:<v>\n' → SAMPLE_DELAY_MS           (1–20)
+//    'P6:<v>\n' → ALPHA×100                 (1–50)
+//
+//  Motor 2 tunable parameters (app Suction Valve knobs):
+//    'Q1:<v>\n' → M2_RAW_THRESHOLD          (200–1023)
+//    'Q2:<v>\n' → M2_TRIGGER_COUNT          (1–20)
+//    'Q3:<v>\n' → M2_RESET_COUNT            (5–100)
+//
+//  ─── PRIORITY ────────────────────────────────────────
+//  Bluetooth overrides EMG while a BT motor command is active.
+//  Releasing with 'S' returns full control to EMG.
+//
+//  ─── BUG FIXES in this version ───────────────────────
+//  - Replaced all `return` with `break` inside BT receive
+//    loop so loop() continues normally after each command.
+//  - Added '\n' flush guard so stray newlines from app do
+//    not accumulate in btBuffer.
+//  - Graph stream now continues correctly even while motor
+//    BT commands are active.
+// =====================================================
+
+#include <SoftwareSerial.h>
+
+// ── SoftwareSerial for HC-05 ─────────────────────────
+SoftwareSerial BT(2, 3);
+
+// ── Pin Definitions ──────────────────────────────────
+const int EMG_PIN        = A0;
+const int SWITCH_PIN     = 7;
+const int SWITCH_FWD_PIN = 6;
+
+const int IN1 = 8;
+const int IN2 = 9;
+const int IN3 = 10;
+const int IN4 = 11;
+
+// ── Motor 1 Tunable Parameters (runtime-adjustable) ──
+int   calibrationSamples  = 500;
+float thresholdMultiplier = 1.05;
+int   activationCount     = 30;
+int   deactivationCount   = 15;
+int   sampleDelayMs       = 5;
+float alpha               = 0.10;
+
+// ── Motor 2 Tunable Parameters (runtime-adjustable) ──
+int  m2RawThreshold = 1000;
+int  m2TriggerCount = 1;
+int  m2ResetCount   = 20;
+
+// ── Motor 1 State Machine (Modes 1 & 2) ──────────────
+enum ArmState { CLOSED, OPENING, OPEN, CLOSING };
+ArmState armState = CLOSED;
+
+// ── Motor 1 Cycle State (Mode 4) ─────────────────────
+enum CycleState { CYCLE_FWD, CYCLE_STOP_A, CYCLE_BWD, CYCLE_STOP_B };
+CycleState cycleState   = CYCLE_FWD;
+bool       cycleRunning = false;
+
+// ── Motor 2 State ─────────────────────────────────────
+bool motor2Running = false;
+bool m2Armed       = true;
+int  m2AboveCount  = 0;
+int  m2BelowCount  = 0;
+
+// ── Bluetooth State ───────────────────────────────────
+char btMotor1Cmd  = ' ';
+char btMotor2Cmd  = ' ';
+bool graphEnabled = false;
+
+// ── BT line-receive buffer (for multi-char P/Q commands)
+String btBuffer = "";
+
+// ── Motor 1 Runtime Variables ────────────────────────
+int   baselineEMG = 0;
+int   threshold   = 0;
+int   aboveCount  = 0;
+int   belowCount  = 0;
+int   rawEMG      = 0;
+int   envelope    = 0;
+
+// ── Previous switch states ────────────────────────────
+bool prevM1Active = true;
+bool prevFwdLock  = false;
+
+// ─────────────────────────────────────────────────────
+//  MOTOR HELPERS
+// ─────────────────────────────────────────────────────
+void motor1Open()  { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  }
+void motor1Close() { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
+void motor1Stop()  { digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  }
+
+void motor2Forward()  { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  motor2Running = true;  }
+void motor2Backward() { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); motor2Running = true;  }
+void motor2Stop()     { digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);  motor2Running = false; }
+
+// ─────────────────────────────────────────────────────
+//  RESET HELPERS
+// ─────────────────────────────────────────────────────
+void resetMotor1State() {
+  armState   = CLOSED;
+  aboveCount = 0;
+  belowCount = 0;
+  envelope   = 0;
+}
+
+void resetCycleState() {
+  cycleState   = CYCLE_FWD;
+  cycleRunning = false;
+  aboveCount   = 0;
+  belowCount   = 0;
+  envelope     = 0;
+}
+
+// ─────────────────────────────────────────────────────
+//  CALIBRATION
+// ─────────────────────────────────────────────────────
+void calibrate() {
+  Serial.println("=== CALIBRATION STARTED ===");
+  Serial.println("RELAX your arm completely...");
+
+  long sum = 0;
+  for (int i = 0; i < calibrationSamples; i++) {
+    sum += analogRead(EMG_PIN);
+    delay(sampleDelayMs);
+  }
+
+  baselineEMG = sum / calibrationSamples;
+  threshold   = (int)(baselineEMG * thresholdMultiplier);
+
+  Serial.print("Baseline EMG : "); Serial.println(baselineEMG);
+  Serial.print("Threshold    : "); Serial.println(threshold);
+  Serial.println("=== CALIBRATION DONE ===\n");
+}
+
+// ─────────────────────────────────────────────────────
+//  PARSE BLUETOOTH PARAMETER COMMANDS
+//  Handles: P1–P6:<value>  and  Q1–Q3:<value>
+// ─────────────────────────────────────────────────────
+void parseBTCommand(String line) {
+  line.trim();
+  if (line.length() < 4) return;
+
+  char category = line.charAt(0);
+  int  paramNum = line.charAt(1) - '0';
+  int  colonIdx = line.indexOf(':');
+  if (colonIdx < 0) return;
+
+  int value = line.substring(colonIdx + 1).toInt();
+
+  if (category == 'P') {
+    switch (paramNum) {
+      case 1:
+        calibrationSamples = constrain(value, 100, 1000);
+        Serial.print("[P1] calibrationSamples = ");
+        Serial.println(calibrationSamples);
+        break;
+      case 2:
+        thresholdMultiplier = constrain(value, 100, 200) / 100.0;
+        threshold = (int)(baselineEMG * thresholdMultiplier);
+        Serial.print("[P2] thresholdMultiplier = ");
+        Serial.println(thresholdMultiplier);
+        Serial.print("     threshold updated   = ");
+        Serial.println(threshold);
+        break;
+      case 3:
+        activationCount = constrain(value, 5, 100);
+        Serial.print("[P3] activationCount = ");
+        Serial.println(activationCount);
+        break;
+      case 4:
+        deactivationCount = constrain(value, 5, 100);
+        Serial.print("[P4] deactivationCount = ");
+        Serial.println(deactivationCount);
+        break;
+      case 5:
+        sampleDelayMs = constrain(value, 1, 20);
+        Serial.print("[P5] sampleDelayMs = ");
+        Serial.println(sampleDelayMs);
+        break;
+      case 6:
+        alpha = constrain(value, 1, 50) / 100.0;
+        Serial.print("[P6] alpha = ");
+        Serial.println(alpha);
+        break;
+    }
+
+  } else if (category == 'Q') {
+    switch (paramNum) {
+      case 1:
+        m2RawThreshold = constrain(value, 200, 1023);
+        Serial.print("[Q1] m2RawThreshold = ");
+        Serial.println(m2RawThreshold);
+        break;
+      case 2:
+        m2TriggerCount = constrain(value, 1, 20);
+        Serial.print("[Q2] m2TriggerCount = ");
+        Serial.println(m2TriggerCount);
+        break;
+      case 3:
+        m2ResetCount = constrain(value, 5, 100);
+        Serial.print("[Q3] m2ResetCount = ");
+        Serial.println(m2ResetCount);
+        break;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  BT.begin(9600);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  motor1Stop();
+  motor2Stop();
+
+  pinMode(SWITCH_PIN,     INPUT_PULLUP);
+  pinMode(SWITCH_FWD_PIN, INPUT_PULLUP);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_BUILTIN, HIGH); delay(150);
+    digitalWrite(LED_BUILTIN, LOW);  delay(150);
+  }
+
+  calibrate();
+}
+
+// ─────────────────────────────────────────────────────
+//  MAIN LOOP
+// ─────────────────────────────────────────────────────
+void loop() {
+
+  // ════════════════════════════════════════════════════
+  //  READ SWITCHES → determine operating mode
+  // ════════════════════════════════════════════════════
+  bool sw1 = (digitalRead(SWITCH_PIN)     == HIGH);  // true = SW1 open (OFF)
+  bool sw2 = (digitalRead(SWITCH_FWD_PIN) == LOW);   // true = SW2 closed (ON)
+
+  bool modeNormal  = ( sw1 && !sw2);  // Mode 1
+  bool modeFwdOnly = (!sw1 && !sw2);  // Mode 2
+  bool modeSuction = (!sw1 &&  sw2);  // Mode 3
+  bool modeCycle   = ( sw1 &&  sw2);  // Mode 4
+
+  bool currentM1Active = (modeNormal || modeFwdOnly || modeCycle);
+  bool currentFwdLock  = modeFwdOnly;
+
+  // ── Mode change on Switch 1 ───────────────────────
+  if (currentM1Active != prevM1Active) {
+    motor1Stop(); motor2Stop();
+    btMotor1Cmd   = ' '; btMotor2Cmd = ' ';
+    motor2Running = false;
+    resetMotor1State(); resetCycleState();
+    m2Armed = true; m2AboveCount = 0; m2BelowCount = 0;
+
+    if (modeNormal)  Serial.println("[MODE] → 1: Normal toggle");
+    if (modeFwdOnly) Serial.println("[MODE] → 2: Forward-only");
+    if (modeSuction) Serial.println("[MODE] → 3: Suction/Motor2");
+    if (modeCycle)   Serial.println("[MODE] → 4: Cycle Fwd/Stop/Bwd/Stop");
+
+    prevM1Active = currentM1Active;
+  }
+
+  // ── Mode change on Switch 2 ───────────────────────
+  if (currentFwdLock != prevFwdLock) {
+    motor1Stop(); motor2Stop();
+    btMotor1Cmd   = ' '; btMotor2Cmd = ' ';
+    motor2Running = false;
+    resetMotor1State(); resetCycleState();
+    m2Armed = true; m2AboveCount = 0; m2BelowCount = 0;
+
+    if (modeNormal)  Serial.println("[MODE] → 1: Normal toggle");
+    if (modeFwdOnly) Serial.println("[MODE] → 2: Forward-only");
+    if (modeSuction) Serial.println("[MODE] → 3: Suction/Motor2");
+    if (modeCycle)   Serial.println("[MODE] → 4: Cycle Fwd/Stop/Bwd/Stop");
+
+    prevFwdLock = currentFwdLock;
+  }
+
+  // ════════════════════════════════════════════════════
+  //  BLUETOOTH RECEIVE
+  //  FIX: replaced all `return` with `break` so loop()
+  //  continues normally after handling each command.
+  //  Single-char commands handled immediately.
+  //  Multi-char P/Q commands buffered until '\n'.
+  // ════════════════════════════════════════════════════
+  while (BT.available()) {
+    char c = BT.read();
+
+    // ── Newline / carriage return → process buffer ───
+    if (c == '\n' || c == '\r') {
+      if (btBuffer.length() > 0) {
+        // Only parse if it looks like a P/Q command
+        // Single chars that got a \n appended are ignored
+        if (btBuffer.length() >= 4 &&
+           (btBuffer.charAt(0) == 'P' || btBuffer.charAt(0) == 'Q')) {
+          parseBTCommand(btBuffer);
+        }
+        btBuffer = "";
+      }
+      continue;
+    }
+
+    // ── Single-char commands ─────────────────────────
+    // Only process if buffer is empty (not mid P/Q command)
+    if (btBuffer.length() == 0) {
+      bool handled = true;
+      switch (c) {
+        case 'F':
+          if (!modeSuction) {
+            btMotor1Cmd = 'F';
+            motor1Open();
+            Serial.println("[BT M1] → FORWARD");
+          }
+          break;
+        case 'B':
+          if (!modeSuction) {
+            btMotor1Cmd = 'B';
+            motor1Close();
+            Serial.println("[BT M1] → BACKWARD");
+          }
+          break;
+        case 'L':
+          btMotor2Cmd = 'L';
+          motor2Forward();
+          Serial.println("[BT M2] → FORWARD (suction ON)");
+          break;
+        case 'R':
+          btMotor2Cmd = 'R';
+          motor2Backward();
+          Serial.println("[BT M2] → BACKWARD (suction OFF)");
+          break;
+        case 'S':
+          btMotor1Cmd  = ' ';
+          btMotor2Cmd  = ' ';
+          cycleRunning = false;
+          motor1Stop();
+          motor2Stop();
+          Serial.println("[BT] → STOP");
+          break;
+        case 'G':
+          graphEnabled = true;
+          Serial.println("[BT] → Graph STARTED");
+          break;
+        case 'X':
+          graphEnabled = false;
+          Serial.println("[BT] → Graph STOPPED");
+          break;
+        default:
+          handled = false;
+          break;
+      }
+      // If it was a recognised single-char command, skip
+      // buffering and move to the next available byte
+      if (handled) continue;
+    }
+
+    // ── Accumulate multi-char P/Q command ────────────
+    btBuffer += c;
+    if (btBuffer.length() > 20) btBuffer = "";  // overflow guard
+  }
+
+  // ── BT control flags ─────────────────────────────
+  bool btControllingM1 = (btMotor1Cmd != ' ');
+  bool btControllingM2 = (btMotor2Cmd != ' ');
+
+  // ════════════════════════════════════════════════════
+  //  EMG PROCESSING
+  // ════════════════════════════════════════════════════
+  rawEMG = analogRead(EMG_PIN);
+
+  // ── MOTOR 2 EMG — Mode 3 only ────────────────────
+  if (modeSuction && !btControllingM2) {
+    if (rawEMG > m2RawThreshold) {
+      m2AboveCount++;
+      m2BelowCount = 0;
+    } else {
+      m2BelowCount++;
+      if (m2BelowCount >= m2ResetCount) {
+        m2Armed      = true;
+        m2BelowCount = m2ResetCount;
+      }
+      m2AboveCount = 0;
+    }
+    if (m2Armed && m2AboveCount >= m2TriggerCount) {
+      m2Armed      = false;
+      m2AboveCount = 0;
+      if (!motor2Running) {
+        motor2Forward();
+        Serial.println("[EMG M2] → STARTED");
+      } else {
+        motor2Stop();
+        Serial.println("[EMG M2] → STOPPED");
+      }
+    }
+  }
+
+  // ── MOTOR 1 EMG — Modes 1, 2, 4 ─────────────────
+  if (!modeSuction && !btControllingM1) {
+
+    float rectified = abs(rawEMG - baselineEMG);
+    envelope = (int)(alpha * rectified + (1.0 - alpha) * envelope);
+    bool muscleActive = (envelope > (threshold - baselineEMG));
+
+    if (muscleActive) {
+      aboveCount++;
+      if (aboveCount > 1000) aboveCount = 1000;
+      belowCount = 0;
+    } else {
+      belowCount++;
+      if (belowCount > 1000) belowCount = 1000;
+      aboveCount = 0;
+    }
+
+    // ── Mode 4: Cycle ──────────────────────────────
+    if (modeCycle) {
+      static bool cycleWaitingRelax = false;
+      if (!cycleWaitingRelax) {
+        if (aboveCount >= activationCount) {
+          aboveCount = 0;
+          switch (cycleState) {
+            case CYCLE_FWD:
+              motor1Open();
+              cycleRunning = true;
+              Serial.println("[M4] → FWD");
+              cycleState = CYCLE_STOP_A;
+              break;
+            case CYCLE_STOP_A:
+              motor1Stop();
+              cycleRunning = false;
+              Serial.println("[M4] → STOP (post-fwd)");
+              cycleState = CYCLE_BWD;
+              break;
+            case CYCLE_BWD:
+              motor1Close();
+              cycleRunning = true;
+              Serial.println("[M4] → BWD");
+              cycleState = CYCLE_STOP_B;
+              break;
+            case CYCLE_STOP_B:
+              motor1Stop();
+              cycleRunning = false;
+              Serial.println("[M4] → STOP (post-bwd)");
+              cycleState = CYCLE_FWD;
+              break;
+          }
+          cycleWaitingRelax = true;
+          belowCount = 0;
+        }
+      } else {
+        if (belowCount >= deactivationCount) {
+          belowCount = 0;
+          cycleWaitingRelax = false;
+        }
+      }
+
+    // ── Mode 2: Forward-only ───────────────────────
+    } else if (modeFwdOnly) {
+      switch (armState) {
+        case CLOSED: case OPEN:
+          if (aboveCount >= activationCount) {
+            armState = OPENING;
+            aboveCount = 0;
+            motor1Open();
+            Serial.println("[M2] → FWD");
+          }
+          break;
+        case OPENING:
+          if (muscleActive) motor1Open();
+          if (belowCount >= deactivationCount) {
+            armState = OPEN;
+            belowCount = 0;
+            motor1Stop();
+            Serial.println("[M2] → STOP");
+          }
+          break;
+        case CLOSING:
+          armState = OPEN;
+          motor1Stop();
+          break;
+      }
+
+    // ── Mode 1: Normal toggle ──────────────────────
+    } else if (modeNormal) {
+      switch (armState) {
+        case CLOSED:
+          if (aboveCount >= activationCount) {
+            armState = OPENING;
+            aboveCount = 0;
+            motor1Open();
+            Serial.println("[M1] → OPENING");
+          }
+          break;
+        case OPENING:
+          if (muscleActive) motor1Open();
+          if (belowCount >= deactivationCount) {
+            armState = OPEN;
+            belowCount = 0;
+            motor1Stop();
+            Serial.println("[M1] → OPEN");
+          }
+          break;
+        case OPEN:
+          if (aboveCount >= activationCount) {
+            armState = CLOSING;
+            aboveCount = 0;
+            motor1Close();
+            Serial.println("[M1] → CLOSING");
+          }
+          break;
+        case CLOSING:
+          if (muscleActive) motor1Close();
+          if (belowCount >= deactivationCount) {
+            armState = CLOSED;
+            belowCount = 0;
+            motor1Stop();
+            Serial.println("[M1] → CLOSED");
+          }
+          break;
+      }
+    }
+  }
+
+  // ── Serial Plotter (USB) ─────────────────────────
+  Serial.print("RAW:");      Serial.print(rawEMG);
+  Serial.print(" ENV:");     Serial.print(envelope + baselineEMG);
+  Serial.print(" THRESH:");  Serial.print(threshold);
+  Serial.print(" M2_LINE:"); Serial.print(m2RawThreshold);
+  Serial.print(" M1:");      Serial.print(armState);
+  Serial.print(" M2:");      Serial.print(motor2Running ? 1 : 0);
+  Serial.print(" MODE:");
+  if      (modeNormal)  Serial.print("1-NRM");
+  else if (modeFwdOnly) Serial.print("2-FWD");
+  else if (modeSuction) Serial.print("3-SUC");
+  else if (modeCycle)   Serial.print("4-CYC");
+  Serial.print(" CYC:");     Serial.println((int)cycleState);
+
+  // ── Bluetooth Graph Stream ────────────────────────
+  if (graphEnabled) {
+    BT.print("G:");
+    BT.print(rawEMG);
+    BT.print(",");
+    BT.print(envelope + baselineEMG);
+    BT.print(",");
+    BT.print(threshold);
+    BT.print(",");
+    BT.println(m2RawThreshold);
+  }
+
+  delay(sampleDelayMs);
+}
